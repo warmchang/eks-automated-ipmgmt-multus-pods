@@ -22,7 +22,7 @@ def tprint(var):
     
 # This function, Finds the ENIs, for a list of given ipv6 secondary IPs 
 # If an ENI is found, then the IPs are unassigned from that ENI 
-def release_ipv6(ip6List,subnet_cidr,client):
+def release_ipv6(ip6List,client):
     tprint("Going to release ip6List: " + str(ip6List))     
     
     response = client.describe_network_interfaces(
@@ -98,6 +98,7 @@ def get_instance_id():
     except Exception as e:
         tprint("Execption: caught exception " + str(e.__class__.__name__))
         raise             
+          
 ## This function runs the shell command and returns the command output
 def shell_run_cmd(cmd,retCode=0):
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,encoding="utf-8")
@@ -126,7 +127,8 @@ def get_subnet_cidr(ec2_client,subnetId):
 ## This function collects the details of each ENI attached to the worker node and corrresponding subnet IDs
 # later it fetches the subnetCIDR for the given subnet ID and stores them in a Dictionary where key is the CidrBlock and value is the ENI id
 # All exceptions handled in the main function
-def get_instanceDetails(ec2_client,instance_id,instanceData):
+def get_instanceDetails(ec2_client,instance_id,macENIMapping):
+    ##Collect macAddresses from instance
     response = ec2_client.describe_instances(
         InstanceIds= [ instance_id ]
     )
@@ -135,24 +137,165 @@ def get_instanceDetails(ec2_client,instance_id,instanceData):
         for j in i["NetworkInterfaces"]:
             ##skip eth0 interface addition in the decideData collection
             if j['Attachment']['DeviceIndex'] !=0:
+                mac=j['MacAddress']
+                macENIMapping[mac] = {"NetworkInterfaceId": j["NetworkInterfaceId"]}
                 cidrBlock, ipv6CidrBlock = get_subnet_cidr(ec2_client,j["SubnetId"])
                 if len(cidrBlock) > 0:
-                    instanceData[cidrBlock] = j["NetworkInterfaceId"]
-                    tprint("Node ENIC: "+ j["NetworkInterfaceId"] + " Ipv4 cidr: " + cidrBlock  + " subnetID: " + j["SubnetId"])
+                    macENIMapping[mac]["v4cidr"]= cidrBlock
+                    tprint("Node ENIC: "+ j["NetworkInterfaceId"] + " Ipv4 cidr: " + cidrBlock  + " subnetID: " + j["SubnetId"] + ' mac: ' + mac) 
                 if len(ipv6CidrBlock) > 0:
-                    instanceData[ipv6CidrBlock] = j["NetworkInterfaceId"]
-                    tprint("Node ENIC: "+ j["NetworkInterfaceId"] + " Ipv6 cidr: " + ipv6CidrBlock  + " subnetID: " + j["SubnetId"])
+                    macENIMapping[mac]["v6cidr"]= ipv6CidrBlock
+                    tprint("Node ENIC: "+ j["NetworkInterfaceId"] + " Ipv6 cidr: " + ipv6CidrBlock  + " subnetID: " + j["SubnetId"]+ ' mac: ' + mac) 
             else:
                 tprint("skipping eth0 (device index 0 ) ENI: " + j["NetworkInterfaceId"] )
+
+def perfromCidrMatch(input,target):
+    match=""
+    inputNetwork = IPNetwork(input)
+    targetNetwork = IPNetwork(target)
+    if inputNetwork == targetNetwork:
+        match="EXACT"
+    elif inputNetwork in targetNetwork:
+        match="SUBSET"
+    return match
+## if provided cidr matches with subnet cidrs attached to worker node, then eniId is returned else return ""
+def getInstanceENIIdFromCIDR(cidr,instanceNetworkingData):
+    eniId=""
+    subnet = IPNetwork(cidr)
+    version = subnet.version
+    for key in instanceNetworkingData:
+        instanceSubnetcidr=""
+        if version == 6:
+            if "v6cidr" in instanceNetworkingData[key]:
+                instanceSubnetcidr = instanceNetworkingData[key]["v6cidr"]
+        else:
+            if "v4cidr" in instanceNetworkingData[key]:
+                instanceSubnetcidr = instanceNetworkingData[key]["v4cidr"]
+        if instanceSubnetcidr:
+            match=perfromCidrMatch(cidr,instanceSubnetcidr)
+            if match:
+                eniId = instanceNetworkingData[key]["NetworkInterfaceId"]
+                tprint(match + " CIDR Match found!!!  cidr: " + cidr + " matches with attached worker node subnet cidrs. will be processed for secondary ip assignment on ENIID " + eniId)
+            if eniId:
+                break
+    
+    return eniId
+
+def ipAddressAssignmentHandling(cmd, currIPList, instanceNetworkingData, ec2ClientArr):
+    ipmap = defaultdict(list)
+    ip6map = defaultdict(list)
+    noChange=True
+    retCode=0
+    try:
+        output = shell_run_cmd(cmd,retCode)
+        if retCode == 0 :
+            interfaceList = output.splitlines()
+            newIPList = []
+            for interface in interfaceList:
+                if interface.strip(): # remove leading and trailing whitespace characters (spaces, tabs, newlines, etc.) from a string
+                    ## Ex: aa:bb:cc:dd:ee:ff=192.168.192.17/30
+                    data=interface.split('=')
+                    mac=data[0]
+                    if len(data) > 1:
+                        ipList=[]
+                        if data[1]: 
+                            ipList=data[1].split(' ') 
+                        if len(ipList) > 0 :
+                            newIPList.extend(ipList)
+                            #IPVLAN case when mac address matches with the instance mac-address
+                            if mac in instanceNetworkingData:
+                                v4Cidr=instanceNetworkingData[mac]['v4cidr'] if  'v4cidr' in instanceNetworkingData[mac] else ""
+                                v6Cidr=instanceNetworkingData[mac]['v6cidr'] if  'v6cidr' in instanceNetworkingData[mac] else ""
+                                eniId=instanceNetworkingData[mac]['NetworkInterfaceId']
+                                for ipaddress in ipList:
+                                    if ipaddress not in currIPList:
+                                        ip = IPNetwork(ipaddress)
+                                        cidr = str(ip.cidr) 
+                                        version = ip.version
+                                        match=""
+                                        if version == 4:
+                                            if v4Cidr:
+                                                match=perfromCidrMatch(cidr,v4Cidr)
+                                                if match : #if cidr on the pod matches or is subset of the subnet cidrs attached to worker node
+                                                    ipmap[eniId].append(str(ip.ip))
+                                                    tprint(match+" Match found!!! pod ip address: " + ipaddress + " with cidr: " + cidr + " matches with attached worker node subnet cidrs. will be processed for secondary ip assignment on ENIID " + eniId)
+                                        else:
+                                            if v6Cidr:
+                                                match=perfromCidrMatch(cidr,v6Cidr)
+                                                if match : #if cidr on the pod matches or is subset of the subnet cidrs attached to worker node                                            ip6map[eniId].append(str(ip.ip))
+                                                    ip6map[eniId].append(str(ip.ip))
+                                                    tprint(match+" Match found!!! pod ip address: " + ipaddress + " with cidr: " + cidr + " matches with attached worker node subnet cidrs. will be processed for secondary ip assignment on ENIID " + eniId)
+                                        if not match:
+                                                tprint("No Match found!!! pod ip address: " + ipaddress + " with cidr: " + cidr +  " doesnt match with attached subnet cidrs.Skipping secondary ip assignment!!!")
+                                        noChange=False
+                            else: #macvlan or some other corner/special case when POD mac doesnt match the instance mac. Check if subnet cidr of the applictaion/pod matches with instance subnet CIDR.
+                                # such cases we  support single IP per cidr (cant have multiple ENI from same subnet) 
+                                for ipaddress in ipList:
+                                    if ipaddress not in currIPList:
+                                        ip = IPNetwork(ipaddress)
+                                        cidr = str(ip.cidr) 
+                                        eniId=getInstanceENIIdFromCIDR(cidr,instanceNetworkingData) 
+                                        if eniId: 
+                                            if  netaddr.valid_ipv4(str(ip.ip)):
+                                                ipmap[eniId].append(str(ip.ip))
+                                            else :
+                                                ip6map[eniId].append(str(ip.ip))
+                                            tprint("Special case. Match found!!! MAC " + mac + " didnt match with worker mac addresses, but pod ip address: " + ipaddress + " with cidr: " + cidr + " matches with attached worker node subnet cidrs. will be processed for secondary ip assignment on ENIID " + eniId)
+                                        else:
+                                            tprint("No Match found!!! MAC " + mac + " didnt match with worker mac addresses, and pod ip address: " + ipaddress + " with cidr: " + cidr + " didnt match with any of the worker node subnet cidrs. Skipping secondary ip assignment!!!")
+                                        noChange=False
+            # if there are changes in the ips (new vs old) then reassign the ipv4 IP addresses asynchronously to save time  (parallel execution)  
+            if noChange == False :   
+                if len(ipmap) > 0:                        
+                    procipv4 = []   
+                    for eniId in ipmap:    
+                        p = Process(target=assign_ip_to_nic, args=(ipmap[eniId], eniId, ec2ClientArr[eniId]))
+                        p.start()
+                        procipv4.append(p)                    
+                    # wait for  the parallel requests to complete execution and return 
+                    for p in procipv4:
+                        p.join(2)    
+                    tprint ("Finished all IPV4 Assignments: " + str(ipmap.values()))           
+                    # if there are changes in the ips (new vs old) then release the ipv6 IP addresses from old ENIs asynchronously to save time  (parallel execution)  
+                if len(ip6map) > 0:
+                    procipv6 = []                   
+                    for  eniId in ip6map:      
+                        p = Process(target=release_ipv6, args=(ip6map[eniId],ec2ClientArr[eniId]))
+                        p.start()
+                        procipv6.append(p) 
+                    for p in procipv6:
+                        p.join(2)    
+                    # if there are changes in the ips (new vs old) then relassignease the ipv6 IP addressess to the worker ENIs asynchronously to save time  (parallel execution)  
+                    for  eniId in ip6map:      
+                        p = Process(target=assign_ip6_to_nic, args=(ip6map[eniId],eniId,ec2ClientArr[eniId])) 
+                        p.start()
+                        procipv6.append(p) 
+                    for p in procipv6:
+                        p.join(2)                           
+                    tprint ("Finished all IPv6: " + str(ip6map.values()))       
+                # Once all the ipv4 and ipv6 assignments are completed, then copy the newIp list as current List     
+                currIPList.clear()
+                currIPList.extend(newIPList)    
+                tprint("updated currIPList"+ str(currIPList))   
+
+        else:
+            tprint ("Error received: " + retCode + " for command: "+ cmd )
+    except (Exception) as e:
+        tprint ("Exception in function ipAddressAssignmentHandling:" + str(e))  
+        raise       
 
 def main():    
     instance_id = None
     currIPList = []
-    cmd = "ip a |grep -v eth0|grep 'scope global' |cut -d ' ' -f 6"
+    #ipOnlyCmd = "ip a |grep -v eth0|grep 'scope global' |cut -d ' ' -f 6"
+    ipWithMacCmd = "for x in `ls /sys/class/net/ | grep -vE 'eth0|lo'`; do y=`ip a show dev $x | grep -E 'link/ether'|cut -d ' ' -f 6`;z=`ip a show dev $x | grep -E 'scope global'|cut -d ' ' -f 6`; echo ${y}=${z}; done"
     region= None
-    instanceData = {}
+    instanceNetworkingData = {} # A dictionary with key as MAC address and values are {NetworkInterfaceId, v4Cidr, v4Cidr}.Each EC2 instance will have unique Mac Address 
     initcontainer=False
-    if len(sys.argv) >0 :
+    ec2ClientArr  =  {} 
+    exceptionCtr=0 
+    MAXEXCEPTION=60
+    if len(sys.argv) > 0 :
         if sys.argv[1] == "initContainers":
             initcontainer=True
     if initcontainer == False:
@@ -168,80 +311,28 @@ def main():
                 region = data[1]
                 tprint ("Got InstanceId: " + instance_id + " region: " + region)  
                 ec2_client = boto3.client('ec2', region_name=region)
-                get_instanceDetails(ec2_client,instance_id,instanceData)
-                ec2ClientArr  =  {} 
-                #Tn this coode, we are planning to do parallel processing and same client cant be used parallely for multiple parallel requests, so we are creating a Map/dictionary of ec2 clients for each ENI/subnet CIDR attached to the worker 
-                # These clients are stored as values against the dictionary where subnet cidr is the key
-                for cidr in instanceData:
-                    k = boto3.client('ec2', region_name=region)
-                    ec2ClientArr[cidr] = k
-            #Run the shell command on the pod which will get the list of multus secondary interfaces Ips (non eth0)    
-            ips = shell_run_cmd(cmd,retCode)
-            newIPList = ips.splitlines()
-            
-            if retCode == 0 :
-                ipmap = defaultdict(list)
-                ip6map = defaultdict(list)
-                noChange=True
-                #if there are IPs allocated on the pod, and these IPs are not new i.e. not same as received in the previous interation then
-                # Find the subnet cidr from the pod IP address using the IPNetwork helper class and store the ips against the subnet ipcidr (ipv4 and ipv6 separately)
-                if len(newIPList) > 0 :
-                    for ipaddress in newIPList:
-                        if ipaddress not in currIPList:
-                            ip = IPNetwork(ipaddress)
-                            cidr = str(ip.cidr) 
-                            if cidr in instanceData: ## if cidr on the pod matches with subnet cidrs attached to worker node
-                                if  netaddr.valid_ipv4(str(ip.ip)):
-                                    ipmap[cidr].append(str(ip.ip))
-                                else :
-                                    ip6map[cidr].append(str(ip.ip))
-                                tprint("pod ip address: " + ipaddress + " cidr: " + cidr + " matches with attached worker node subnet cidrs. will be processed for secondary ip assignment")
-                            else:
-                                tprint("pod ip address: " + ipaddress + " cidr: " + cidr +  " doesnt match with any of the worker node subnet cidrs. Skipping secondary ip assignment!!!")
-                            noChange=False 
-                    # if there are changes in the ips (new vs old) then reassign the ipv4 IP addresses asynchronously to save time  (parallel execution)  
-                    if noChange == False :  
-                        if len(ipmap) > 0:                        
-                            procipv4 = []   
-                            for  key in ipmap:    
-                                p = Process(target=assign_ip_to_nic, args=(ipmap[key],instanceData[key],ec2ClientArr[key]))
-                                p.start()
-                                procipv4.append(p)                    
-                            # wait for  the parallel requests to complete execution and return 
-                            for p in procipv4:
-                                p.join(2)    
-                            tprint ("Finished all IPV4")            
-                            # if there are changes in the ips (new vs old) then release the ipv6 IP addresses from old ENIs asynchronously to save time  (parallel execution)  
-                        if len(ip6map) > 0:
-                            procipv6 = []                   
-                            for  key in ip6map:        
-                                p = Process(target=release_ipv6, args=(ip6map[key],key,ec2ClientArr[key]))
-                                p.start()
-                                procipv6.append(p) 
-                            for p in procipv6:
-                                p.join(2)    
-                            # if there are changes in the ips (new vs old) then relassignease the ipv6 IP addressess to the worker ENIs asynchronously to save time  (parallel execution)  
-                            for  key in ip6map:      
-                                p = Process(target=assign_ip6_to_nic, args=(ip6map[key],instanceData[key],ec2ClientArr[key])) 
-                                p.start()
-                                procipv6.append(p) 
-                            for p in procipv6:
-                                p.join(2)                           
-                            tprint ("Finished all IPv6")     
-                        # Once all the ipv4 and ipv6 assignments are completed, then copy the newIp list as current List        
-                        currIPList = copy.deepcopy(newIPList)  
-                        if initcontainer == True :
-                            tprint ("Started as initcontainer. Exiting after successful execution")  
-                            exit(0)          
-                else:
-                    tprint ("No IPs present in system for cmd: "+ cmd )            
+                get_instanceDetails(ec2_client,instance_id,instanceNetworkingData)
+                tprint ("Got InstanceNetworkingData: " + str(instanceNetworkingData))
+                # For parallel processing and same client cant be used in parallel for multiple API calls, so we are creating a Map/dictionary of ec2 clients for each ENI/MAC attached to the worker. These clients are stored as values against eniID as key
+                for mac in instanceNetworkingData:
+                    eniId = instanceNetworkingData[mac]["NetworkInterfaceId"]
+                    ec2ClientArr[eniId] = boto3.client('ec2', region_name=region)
+            #Check and Assigne IP addreses to respective ENIs 
+            ipAddressAssignmentHandling(ipWithMacCmd,currIPList,instanceNetworkingData,ec2ClientArr)
+            exceptionCtr = 0
+            if initcontainer == True :
+                tprint ("Started as initcontainer. Exiting after successful execution")  
+                exit(0)      
             else:
-                tprint ("Error received: " + retCode + " for command: "+ cmd )
-        # If these are any exceptions in ip assignment to the NICs then catch it using catch all exception and keep trying & logging untill the problem is resolved
+                time.sleep(0.5)
+        # If these are any exceptions in ip assignment to the NICs then catch it using catch all exception and keep trying & logging upto max counter untill the problem is resolved
         except (Exception) as e:
             tprint ("Exception :" + str(e))     
+            exceptionCtr = exceptionCtr + 1
+            if exceptionCtr > MAXEXCEPTION:
+                tprint ("Max Exception count reached. Exiting")
+                exit(1)
             tprint ("continuing the handling")
-        time.sleep(0.5)
 
 ##Main Usage <scriptName> initContainers|sidecar
 
